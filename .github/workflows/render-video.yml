@@ -172,7 +172,7 @@ jobs:
             > website.txt
 
           printf '%s\n' \
-            "Discover more amazing animals" \
+            "Read the full animal guide" \
             > cta1.txt
 
           printf '%s\n' \
