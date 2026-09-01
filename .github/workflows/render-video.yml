@@ -1,0 +1,32 @@
+name: InfiniAnimals Video Renderer
+
+on:
+  workflow_dispatch:
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg fonts-dejavu-core
+
+      - name: Create test vertical video
+        run: |
+          ffmpeg -y \
+            -f lavfi \
+            -i "color=c=black:s=1080x1920:d=5:r=30" \
+            -vf "drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:text='InfiniAnimals':fontcolor=white:fontsize=90:x=(w-text_w)/2:y=(h-text_h)/2" \
+            -c:v libx264 \
+            -pix_fmt yuv420p \
+            -movflags +faststart \
+            test-video.mp4
+
+      - name: Upload rendered video
+        uses: actions/upload-artifact@v4
+        with:
+          name: infinianimals-test-video
+          path: test-video.mp4
+          retention-days: 1
