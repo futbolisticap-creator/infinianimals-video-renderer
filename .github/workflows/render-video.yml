@@ -2,31 +2,259 @@ name: InfiniAnimals Video Renderer
 
 on:
   workflow_dispatch:
+    inputs:
+      post_id:
+        description: "WordPress post ID"
+        required: true
+        type: string
+
+      animal:
+        description: "Animal name"
+        required: true
+        type: string
+
+      script:
+        description: "Narration script"
+        required: true
+        type: string
+
+      article_url:
+        description: "InfiniAnimals article URL"
+        required: true
+        type: string
+
+      youtube_title:
+        description: "Video title"
+        required: false
+        type: string
+
+permissions:
+  contents: read
 
 jobs:
   render:
     runs-on: ubuntu-latest
 
+    env:
+      POST_ID: ${{ inputs.post_id }}
+      ANIMAL: ${{ inputs.animal }}
+      SCRIPT: ${{ inputs.script }}
+      ARTICLE_URL: ${{ inputs.article_url }}
+      VIDEO_TITLE: ${{ inputs.youtube_title }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+
     steps:
-      - name: Install FFmpeg
+
+      - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg fonts-dejavu-core
+          sudo apt-get install -y ffmpeg jq fonts-dejavu-core curl
 
-      - name: Create test vertical video
+      - name: Get featured image from InfiniAnimals
+        run: |
+          curl -fsSL \
+            "https://infinianimals.com/wp-json/wp/v2/posts/${POST_ID}?_embed=1" \
+            -o post.json
+
+          IMAGE_URL=$(jq -r \
+            '._embedded["wp:featuredmedia"][0].source_url // empty' \
+            post.json)
+
+          if [ -z "$IMAGE_URL" ]; then
+            MEDIA_ID=$(jq -r '.featured_media // 0' post.json)
+
+            if [ "$MEDIA_ID" != "0" ]; then
+              curl -fsSL \
+                "https://infinianimals.com/wp-json/wp/v2/media/${MEDIA_ID}" \
+                -o media.json
+
+              IMAGE_URL=$(jq -r '.source_url // empty' media.json)
+            fi
+          fi
+
+          if [ -z "$IMAGE_URL" ]; then
+            echo "No featured image found"
+            exit 1
+          fi
+
+          curl -fL "$IMAGE_URL" -o animal-image
+
+      - name: Generate narration
+        run: |
+          PROMPT="Narrate this as an energetic, natural wildlife documentary voice.
+
+          Speak clearly and naturally.
+
+          Read this script exactly:
+
+          $SCRIPT"
+
+          jq -n \
+            --arg prompt "$PROMPT" \
+            '{
+              model: "gemini-3.1-flash-tts-preview",
+              input: $prompt,
+              response_format: {
+                type: "audio"
+              },
+              generation_config: {
+                speech_config: [
+                  {
+                    voice: "Puck"
+                  }
+                ]
+              }
+            }' > request.json
+
+          curl -fsS \
+            -X POST \
+            "https://generativelanguage.googleapis.com/v1beta/interactions" \
+            -H "x-goog-api-key: ${GEMINI_API_KEY}" \
+            -H "Content-Type: application/json" \
+            -d @request.json \
+            > response.json
+
+          jq -r \
+            '.. | objects |
+            select(.type? == "audio" and (.data? != null)) |
+            .data' \
+            response.json \
+            | head -n 1 \
+            > audio.b64
+
+          if [ ! -s audio.b64 ]; then
+            echo "Gemini did not return audio"
+            cat response.json
+            exit 1
+          fi
+
+          base64 -d audio.b64 > voice.pcm
+
+          ffmpeg -y \
+            -f s16le \
+            -ar 24000 \
+            -ac 1 \
+            -i voice.pcm \
+            voice.wav
+
+      - name: Prepare branding
+        run: |
+          printf '%s\n' "$ANIMAL" > animal.txt
+          printf '%s\n' "InfiniAnimals.com" > website.txt
+          printf '%s\n' "Discover more animals" > cta1.txt
+          printf '%s\n' "InfiniAnimals.com" > cta2.txt
+
+      - name: Create main video
+        run: |
+          DURATION=$(ffprobe \
+            -v error \
+            -show_entries format=duration \
+            -of default=noprint_wrappers=1:nokey=1 \
+            voice.wav)
+
+          ffmpeg -y \
+            -loop 1 \
+            -framerate 30 \
+            -i animal-image \
+            -i voice.wav \
+            -filter_complex "
+            [0:v]split=2[background][foreground];
+
+            [background]
+            scale=1080:1920:force_original_aspect_ratio=increase,
+            crop=1080:1920,
+            gblur=sigma=35
+            [bg];
+
+            [foreground]
+            scale=1000:1500:force_original_aspect_ratio=decrease
+            [fg];
+
+            [bg][fg]
+            overlay=(W-w)/2:(H-h)/2,
+
+            drawtext=
+              fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:
+              textfile=animal.txt:
+              fontcolor=white:
+              fontsize=70:
+              box=1:
+              boxcolor=black@0.50:
+              boxborderw=20:
+              x=(w-text_w)/2:
+              y=100,
+
+            drawtext=
+              fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:
+              textfile=website.txt:
+              fontcolor=white:
+              fontsize=44:
+              box=1:
+              boxcolor=black@0.55:
+              boxborderw=15:
+              x=(w-text_w)/2:
+              y=h-150,
+
+            fps=30
+            [video]
+            " \
+            -map "[video]" \
+            -map 1:a \
+            -t "$DURATION" \
+            -c:v libx264 \
+            -preset medium \
+            -crf 20 \
+            -pix_fmt yuv420p \
+            -c:a aac \
+            -b:a 192k \
+            -shortest \
+            main.mp4
+
+      - name: Create promotional end screen
         run: |
           ffmpeg -y \
             -f lavfi \
-            -i "color=c=black:s=1080x1920:d=5:r=30" \
-            -vf "drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:text='InfiniAnimals':fontcolor=white:fontsize=90:x=(w-text_w)/2:y=(h-text_h)/2" \
+            -i "color=c=black:s=1080x1920:d=3:r=30" \
+            -f lavfi \
+            -i "anullsrc=channel_layout=stereo:sample_rate=44100" \
+            -vf "
+            drawtext=
+              fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:
+              textfile=cta1.txt:
+              fontcolor=white:
+              fontsize=72:
+              x=(w-text_w)/2:
+              y=720,
+
+            drawtext=
+              fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:
+              textfile=cta2.txt:
+              fontcolor=white:
+              fontsize=82:
+              x=(w-text_w)/2:
+              y=900
+            " \
+            -t 3 \
             -c:v libx264 \
             -pix_fmt yuv420p \
-            -movflags +faststart \
-            test-video.mp4
+            -c:a aac \
+            end.mp4
 
-      - name: Upload rendered video
+      - name: Join video and end screen
+        run: |
+          printf "file 'main.mp4'\nfile 'end.mp4'\n" > files.txt
+
+          ffmpeg -y \
+            -f concat \
+            -safe 0 \
+            -i files.txt \
+            -c copy \
+            -movflags +faststart \
+            video.mp4
+
+      - name: Upload final video
         uses: actions/upload-artifact@v4
         with:
-          name: infinianimals-test-video
-          path: test-video.mp4
+          name: infinianimals-video
+          path: video.mp4
           retention-days: 1
