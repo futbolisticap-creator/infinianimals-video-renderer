@@ -28,6 +28,26 @@ on:
         required: false
         type: string
 
+      media_type:
+        description: "video or image"
+        required: true
+        type: string
+
+      media_url:
+        description: "Pexels media URL"
+        required: true
+        type: string
+
+      creator_name:
+        description: "Pexels creator"
+        required: false
+        type: string
+
+      pexels_page:
+        description: "Pexels source page"
+        required: false
+        type: string
+
 permissions:
   contents: read
 
@@ -41,6 +61,13 @@ jobs:
       SCRIPT: ${{ inputs.script }}
       ARTICLE_URL: ${{ inputs.article_url }}
       VIDEO_TITLE: ${{ inputs.youtube_title }}
+
+      MEDIA_TYPE: ${{ inputs.media_type }}
+      MEDIA_URL: ${{ inputs.media_url }}
+
+      CREATOR_NAME: ${{ inputs.creator_name }}
+      PEXELS_PAGE: ${{ inputs.pexels_page }}
+
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
 
     steps:
@@ -48,44 +75,42 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg jq fonts-dejavu-core curl
+          sudo apt-get install -y ffmpeg jq curl fonts-dejavu-core
 
-      - name: Get featured image from InfiniAnimals
+      - name: Download Pexels media
         run: |
-          curl -fsSL \
-            "https://infinianimals.com/wp-json/wp/v2/posts/${POST_ID}?_embed=1" \
-            -o post.json
 
-          IMAGE_URL=$(jq -r \
-            '._embedded["wp:featuredmedia"][0].source_url // empty' \
-            post.json)
+          echo "Media type: $MEDIA_TYPE"
+          echo "Media URL: $MEDIA_URL"
 
-          if [ -z "$IMAGE_URL" ]; then
-            MEDIA_ID=$(jq -r '.featured_media // 0' post.json)
-
-            if [ "$MEDIA_ID" != "0" ]; then
-              curl -fsSL \
-                "https://infinianimals.com/wp-json/wp/v2/media/${MEDIA_ID}" \
-                -o media.json
-
-              IMAGE_URL=$(jq -r '.source_url // empty' media.json)
-            fi
-          fi
-
-          if [ -z "$IMAGE_URL" ]; then
-            echo "No featured image found"
+          if [ -z "$MEDIA_URL" ]; then
+            echo "No media URL received"
             exit 1
           fi
 
-          curl -fL "$IMAGE_URL" -o animal-image
+          if [ "$MEDIA_TYPE" = "video" ]; then
 
-      - name: Generate narration
+            curl -fL "$MEDIA_URL" -o media.mp4
+
+          elif [ "$MEDIA_TYPE" = "image" ]; then
+
+            curl -fL "$MEDIA_URL" -o media.jpg
+
+          else
+
+            echo "Unsupported media type: $MEDIA_TYPE"
+            exit 1
+
+          fi
+
+      - name: Generate narration with Gemini
         run: |
-          PROMPT="Narrate this as an energetic, natural wildlife documentary voice.
+
+          PROMPT="Narrate this as an energetic, natural wildlife documentary voice for a short social media video.
 
           Speak clearly and naturally.
 
-          Read this script exactly:
+          Read the following script exactly:
 
           $SCRIPT"
 
@@ -139,61 +164,68 @@ jobs:
 
       - name: Prepare branding
         run: |
-          printf '%s\n' "$ANIMAL" > animal.txt
-          printf '%s\n' "InfiniAnimals.com" > website.txt
-          printf '%s\n' "Discover more animals" > cta1.txt
-          printf '%s\n' "InfiniAnimals.com" > cta2.txt
 
-      - name: Create main video
+          printf '%s\n' "$ANIMAL" > animal.txt
+
+          printf '%s\n' \
+            "InfiniAnimals.com" \
+            > website.txt
+
+          printf '%s\n' \
+            "Discover more amazing animals" \
+            > cta1.txt
+
+          printf '%s\n' \
+            "InfiniAnimals.com" \
+            > cta2.txt
+
+      - name: Get narration duration
         run: |
+
           DURATION=$(ffprobe \
             -v error \
             -show_entries format=duration \
             -of default=noprint_wrappers=1:nokey=1 \
             voice.wav)
 
+          echo "DURATION=$DURATION" >> "$GITHUB_ENV"
+
+          echo "Narration duration: $DURATION"
+
+      - name: Create video from Pexels clip
+        if: env.MEDIA_TYPE == 'video'
+        run: |
+
           ffmpeg -y \
-            -loop 1 \
-            -framerate 30 \
-            -i animal-image \
+            -stream_loop -1 \
+            -i media.mp4 \
             -i voice.wav \
             -filter_complex "
-            [0:v]split=2[background][foreground];
-
-            [background]
+            [0:v]
             scale=1080:1920:force_original_aspect_ratio=increase,
             crop=1080:1920,
-            gblur=sigma=35
-            [bg];
-
-            [foreground]
-            scale=1000:1500:force_original_aspect_ratio=decrease
-            [fg];
-
-            [bg][fg]
-            overlay=(W-w)/2:(H-h)/2,
 
             drawtext=
               fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:
               textfile=animal.txt:
               fontcolor=white:
-              fontsize=70:
+              fontsize=65:
               box=1:
-              boxcolor=black@0.50:
-              boxborderw=20:
+              boxcolor=black@0.45:
+              boxborderw=18:
               x=(w-text_w)/2:
-              y=100,
+              y=90,
 
             drawtext=
               fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:
               textfile=website.txt:
               fontcolor=white:
-              fontsize=44:
+              fontsize=45:
               box=1:
               boxcolor=black@0.55:
               boxborderw=15:
               x=(w-text_w)/2:
-              y=h-150,
+              y=h-170,
 
             fps=30
             [video]
@@ -207,22 +239,87 @@ jobs:
             -pix_fmt yuv420p \
             -c:a aac \
             -b:a 192k \
+            -ar 24000 \
+            -ac 1 \
+            -movflags +faststart \
             -shortest \
             main.mp4
 
-      - name: Create promotional end screen
+      - name: Create video from Pexels photo
+        if: env.MEDIA_TYPE == 'image'
         run: |
+
+          ffmpeg -y \
+            -loop 1 \
+            -framerate 30 \
+            -i media.jpg \
+            -i voice.wav \
+            -filter_complex "
+            [0:v]
+            scale=1200:2134:force_original_aspect_ratio=increase,
+            crop=1200:2134,
+
+            zoompan=
+              z='min(zoom+0.0005,1.12)':
+              x='iw/2-(iw/zoom/2)':
+              y='ih/2-(ih/zoom/2)':
+              d=1:
+              s=1080x1920:
+              fps=30,
+
+            drawtext=
+              fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:
+              textfile=animal.txt:
+              fontcolor=white:
+              fontsize=65:
+              box=1:
+              boxcolor=black@0.45:
+              boxborderw=18:
+              x=(w-text_w)/2:
+              y=90,
+
+            drawtext=
+              fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:
+              textfile=website.txt:
+              fontcolor=white:
+              fontsize=45:
+              box=1:
+              boxcolor=black@0.55:
+              boxborderw=15:
+              x=(w-text_w)/2:
+              y=h-170
+
+            [video]
+            " \
+            -map "[video]" \
+            -map 1:a \
+            -t "$DURATION" \
+            -c:v libx264 \
+            -preset medium \
+            -crf 20 \
+            -pix_fmt yuv420p \
+            -c:a aac \
+            -b:a 192k \
+            -ar 24000 \
+            -ac 1 \
+            -movflags +faststart \
+            -shortest \
+            main.mp4
+
+      - name: Create InfiniAnimals end screen
+        run: |
+
           ffmpeg -y \
             -f lavfi \
             -i "color=c=black:s=1080x1920:d=3:r=30" \
             -f lavfi \
-            -i "anullsrc=channel_layout=stereo:sample_rate=44100" \
+            -i "anullsrc=channel_layout=mono:sample_rate=24000" \
             -vf "
             drawtext=
               fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:
               textfile=cta1.txt:
               fontcolor=white:
-              fontsize=72:
+              fontsize=65:
               x=(w-text_w)/2:
               y=720,
 
@@ -230,7 +327,7 @@ jobs:
               fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:
               textfile=cta2.txt:
               fontcolor=white:
-              fontsize=82:
+              fontsize=85:
               x=(w-text_w)/2:
               y=900
             " \
@@ -238,11 +335,16 @@ jobs:
             -c:v libx264 \
             -pix_fmt yuv420p \
             -c:a aac \
+            -ar 24000 \
+            -ac 1 \
             end.mp4
 
-      - name: Join video and end screen
+      - name: Join video and promotional screen
         run: |
-          printf "file 'main.mp4'\nfile 'end.mp4'\n" > files.txt
+
+          printf \
+            "file 'main.mp4'\nfile 'end.mp4'\n" \
+            > files.txt
 
           ffmpeg -y \
             -f concat \
@@ -252,9 +354,19 @@ jobs:
             -movflags +faststart \
             video.mp4
 
+      - name: Save Pexels attribution
+        run: |
+
+          echo "Media source: Pexels" > attribution.txt
+          echo "Creator: $CREATOR_NAME" >> attribution.txt
+          echo "Source: $PEXELS_PAGE" >> attribution.txt
+          echo "Article: $ARTICLE_URL" >> attribution.txt
+
       - name: Upload final video
         uses: actions/upload-artifact@v4
         with:
           name: infinianimals-video
-          path: video.mp4
+          path: |
+            video.mp4
+            attribution.txt
           retention-days: 1
