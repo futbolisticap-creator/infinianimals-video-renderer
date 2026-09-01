@@ -209,7 +209,7 @@ jobs:
               fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:
               textfile=animal.txt:
               fontcolor=white:
-              fontsize=65:
+              fontsize=54:
               box=1:
               boxcolor=black@0.45:
               boxborderw=18:
