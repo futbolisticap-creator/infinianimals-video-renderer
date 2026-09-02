@@ -169,6 +169,130 @@ jobs:
             -i voice.pcm \
             voice.wav
 
+      - name: Generate dynamic subtitles
+        run: |
+          cat > make_subtitles.py <<'PY'
+          from faster_whisper import WhisperModel
+
+          model = WhisperModel(
+              "tiny.en",
+              device="cpu",
+              compute_type="int8"
+          )
+
+          segments, info = model.transcribe(
+              "voice.wav",
+              language="en",
+              word_timestamps=True,
+              vad_filter=True
+          )
+
+          words = []
+
+          for segment in segments:
+              if not segment.words:
+                  continue
+
+              for word in segment.words:
+                  if word.start is None or word.end is None:
+                      continue
+
+                  words.append({
+                      "start": float(word.start),
+                      "end": float(word.end),
+                      "text": word.word.strip()
+                  })
+
+
+          def ass_time(seconds):
+              hours = int(seconds // 3600)
+              minutes = int((seconds % 3600) // 60)
+              secs = seconds % 60
+
+              return f"{hours}:{minutes:02d}:{secs:05.2f}"
+
+
+          groups = []
+          current = []
+
+          for word in words:
+
+              current.append(word)
+
+              text = " ".join(w["text"] for w in current)
+
+              punctuation = text.endswith((".", "!", "?", ","))
+
+              duration = (
+                  current[-1]["end"] -
+                  current[0]["start"]
+              )
+
+              if (
+                  len(current) >= 4
+                  or duration >= 2.2
+                  or punctuation
+              ):
+
+                  groups.append(current)
+                  current = []
+
+          if current:
+              groups.append(current)
+
+
+          with open(
+              "subtitles.ass",
+              "w",
+              encoding="utf-8"
+          ) as f:
+
+              f.write("""[Script Info]
+          ScriptType: v4.00+
+          PlayResX: 1080
+          PlayResY: 1920
+          WrapStyle: 2
+          ScaledBorderAndShadow: yes
+
+          [V4+ Styles]
+          Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding
+          Style: Shorts,DejaVu Sans,64,&H00FFFFFF,&H000000FF,&H00000000,&H90000000,-1,0,0,0,100,100,0,0,1,5,1,2,80,80,380,1
+
+          [Events]
+          Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
+          """)
+
+              for group in groups:
+
+                  start = group[0]["start"]
+                  end = group[-1]["end"]
+
+                  text = " ".join(
+                      word["text"]
+                      for word in group
+                  )
+
+                  text = (
+                      text
+                      .replace("{", "")
+                      .replace("}", "")
+                  )
+
+                  f.write(
+                      f"Dialogue: 0,"
+                      f"{ass_time(start)},"
+                      f"{ass_time(end)},"
+                      f"Shorts,,0,0,0,,"
+                      f"{text}\\n"
+                  )
+
+          print(
+              f"Created {len(groups)} subtitle blocks"
+          )
+          PY
+
+          python make_subtitles.py
+
       - name: Prepare branding
         run: |
 
