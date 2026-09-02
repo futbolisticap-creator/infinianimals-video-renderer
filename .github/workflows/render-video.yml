@@ -123,7 +123,6 @@ jobs:
 
       - name: Generate narration with Gemini
         run: |
-
           PROMPT="Narrate this as an energetic, natural wildlife documentary voice for a short social media video.
 
           Speak clearly and naturally.
@@ -149,13 +148,50 @@ jobs:
               }
             }' > request.json
 
-          curl -fsS \
-            -X POST \
-            "https://generativelanguage.googleapis.com/v1beta/interactions" \
-            -H "x-goog-api-key: ${GEMINI_API_KEY}" \
-            -H "Content-Type: application/json" \
-            -d @request.json \
-            > response.json
+          SUCCESS=false
+
+          for ATTEMPT in 1 2 3 4 5 6; do
+            echo "Gemini TTS attempt ${ATTEMPT}/6..."
+
+            HTTP_CODE=$(curl -sS \
+              -o response.json \
+              -w "%{http_code}" \
+              -X POST \
+              "https://generativelanguage.googleapis.com/v1beta/interactions" \
+              -H "x-goog-api-key: ${GEMINI_API_KEY}" \
+              -H "Content-Type: application/json" \
+              -d @request.json)
+
+            echo "Gemini HTTP status: ${HTTP_CODE}"
+
+            if [ "${HTTP_CODE}" = "200" ]; then
+              SUCCESS=true
+              break
+            fi
+
+            echo "Gemini response:"
+            cat response.json || true
+
+            if [ "${HTTP_CODE}" = "429" ]; then
+              WAIT_SECONDS=$((ATTEMPT * 15))
+              echo "Rate limited by Gemini. Waiting ${WAIT_SECONDS}s before retry..."
+              sleep "${WAIT_SECONDS}"
+            elif [ "${HTTP_CODE}" -ge 500 ] 2>/dev/null; then
+              WAIT_SECONDS=$((ATTEMPT * 10))
+              echo "Temporary Gemini server error. Waiting ${WAIT_SECONDS}s before retry..."
+              sleep "${WAIT_SECONDS}"
+            else
+              echo "Gemini returned a non-retryable HTTP error: ${HTTP_CODE}"
+              exit 1
+            fi
+          done
+
+          if [ "${SUCCESS}" != "true" ]; then
+            echo "Gemini TTS failed after 6 attempts."
+            echo "Last response:"
+            cat response.json || true
+            exit 1
+          fi
 
           jq -r \
             '.. | objects |
@@ -166,7 +202,7 @@ jobs:
             > audio.b64
 
           if [ ! -s audio.b64 ]; then
-            echo "Gemini did not return audio"
+            echo "Gemini returned HTTP 200 but no audio was found."
             cat response.json
             exit 1
           fi
@@ -179,6 +215,13 @@ jobs:
             -ac 1 \
             -i voice.pcm \
             voice.wav
+
+          if [ ! -s voice.wav ]; then
+            echo "voice.wav was not created correctly"
+            exit 1
+          fi
+
+          echo "Narration generated successfully."
 
       - name: Generate dynamic subtitles
         run: |
