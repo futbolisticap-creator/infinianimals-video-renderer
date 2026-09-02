@@ -180,7 +180,7 @@ jobs:
               compute_type="int8"
           )
 
-          segments, info = model.transcribe(
+          segments, _ = model.transcribe(
               "voice.wav",
               language="en",
               word_timestamps=True,
@@ -197,101 +197,73 @@ jobs:
                   if word.start is None or word.end is None:
                       continue
 
+                  text = word.word.strip()
+                  if not text:
+                      continue
+
                   words.append({
                       "start": float(word.start),
                       "end": float(word.end),
-                      "text": word.word.strip()
+                      "text": text
                   })
 
+          def srt_time(seconds):
+              milliseconds = max(0, int(round(seconds * 1000)))
 
-          def ass_time(seconds):
-              hours = int(seconds // 3600)
-              minutes = int((seconds % 3600) // 60)
-              secs = seconds % 60
+              hours = milliseconds // 3600000
+              milliseconds %= 3600000
 
-              return f"{hours}:{minutes:02d}:{secs:05.2f}"
+              minutes = milliseconds // 60000
+              milliseconds %= 60000
 
+              secs = milliseconds // 1000
+              ms = milliseconds % 1000
+
+              return f"{hours:02d}:{minutes:02d}:{secs:02d},{ms:03d}"
 
           groups = []
           current = []
 
           for word in words:
-
               current.append(word)
 
+              duration = current[-1]["end"] - current[0]["start"]
               text = " ".join(w["text"] for w in current)
 
-              punctuation = text.endswith((".", "!", "?", ","))
-
-              duration = (
-                  current[-1]["end"] -
-                  current[0]["start"]
-              )
-
+              # Short, readable blocks for TikTok/Reels/Shorts.
               if (
                   len(current) >= 4
-                  or duration >= 2.2
-                  or punctuation
+                  or duration >= 1.8
+                  or text.endswith((".", "!", "?"))
               ):
-
                   groups.append(current)
                   current = []
 
           if current:
               groups.append(current)
 
+          if not groups:
+              raise RuntimeError("Whisper did not generate subtitle timestamps")
 
-          with open(
-              "subtitles.ass",
-              "w",
-              encoding="utf-8"
-          ) as f:
-
-              f.write("""[Script Info]
-          ScriptType: v4.00+
-          PlayResX: 1080
-          PlayResY: 1920
-          WrapStyle: 2
-          ScaledBorderAndShadow: yes
-
-          [V4+ Styles]
-          Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding
-          Style: Shorts,DejaVu Sans,64,&H00FFFFFF,&H000000FF,&H00000000,&H90000000,-1,0,0,0,100,100,0,0,1,5,1,2,80,80,380,1
-
-          [Events]
-          Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
-          """)
-
-              for group in groups:
-
+          with open("subtitles.srt", "w", encoding="utf-8") as f:
+              for i, group in enumerate(groups, start=1):
                   start = group[0]["start"]
-                  end = group[-1]["end"]
+                  end = max(group[-1]["end"], start + 0.25)
 
-                  text = " ".join(
-                      word["text"]
-                      for word in group
-                  )
+                  text = " ".join(w["text"] for w in group).upper()
+                  text = text.replace("{", "").replace("}", "")
 
-                  text = (
-                      text
-                      .replace("{", "")
-                      .replace("}", "")
-                  )
+                  f.write(f"{i}\n")
+                  f.write(f"{srt_time(start)} --> {srt_time(end)}\n")
+                  f.write(text + "\n\n")
 
-                  f.write(
-                      f"Dialogue: 0,"
-                      f"{ass_time(start)},"
-                      f"{ass_time(end)},"
-                      f"Shorts,,0,0,0,,"
-                      f"{text}\\n"
-                  )
-
-          print(
-              f"Created {len(groups)} subtitle blocks"
-          )
+          print(f"Created {len(groups)} subtitle blocks")
           PY
 
           python make_subtitles.py
+
+          echo "=== SUBTITLE PREVIEW ==="
+          head -40 subtitles.srt
 
       - name: Prepare branding
         run: |
@@ -335,7 +307,7 @@ jobs:
             [0:v]
             scale=1080:1920:force_original_aspect_ratio=increase,
             crop=1080:1920,
-            subtitles=subtitles.ass,
+            subtitles=subtitles.srt:force_style='FontName=DejaVu Sans,FontSize=28,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=4,Shadow=0,Alignment=2,MarginL=90,MarginR=90,MarginV=360,Bold=1',
 
             drawtext=
               fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:
@@ -399,13 +371,13 @@ jobs:
               s=1080x1920:
               fps=30,
 
-            subtitles=subtitles.ass,
+            subtitles=subtitles.srt:force_style='FontName=DejaVu Sans,FontSize=28,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=4,Shadow=0,Alignment=2,MarginL=90,MarginR=90,MarginV=360,Bold=1',
 
             drawtext=
               fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:
               textfile=animal.txt:
               fontcolor=white:
-              fontsize=65:
+              fontsize=54:
               box=1:
               boxcolor=black@0.45:
               boxborderw=18:
@@ -453,7 +425,7 @@ jobs:
               fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:
               textfile=cta1.txt:
               fontcolor=white:
-              fontsize=65:
+              fontsize=54:
               x=(w-text_w)/2:
               y=720,
 
