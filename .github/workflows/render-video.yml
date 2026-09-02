@@ -38,6 +38,11 @@ on:
         required: true
         type: string
 
+      media_items:
+        description: "JSON array with up to 5 media scenes"
+        required: false
+        type: string
+
       creator_name:
         description: "Pexels creator"
         required: false
@@ -64,6 +69,7 @@ jobs:
 
       MEDIA_TYPE: ${{ inputs.media_type }}
       MEDIA_URL: ${{ inputs.media_url }}
+      MEDIA_ITEMS: ${{ inputs.media_items }}
 
       CREATOR_NAME: ${{ inputs.creator_name }}
       PEXELS_PAGE: ${{ inputs.pexels_page }}
@@ -351,7 +357,7 @@ jobs:
               "\n"
               "[V4+ Styles]\n"
               "Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding\n"
-              "Style: Shorts,Bangers,72,&H00FFFFFF,&H000000FF,&H00000000,&H30000000,0,0,0,0,100,100,1,0,1,5,2,2,90,90,360,1\n"
+              "Style: Shorts,Bangers,64,&H00FFFFFF,&H000000FF,&H00000000,&H30000000,0,0,0,0,100,100,1,0,1,5,2,2,90,90,360,1\n"
               "\n"
               "[Events]\n"
               "Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text\n"
