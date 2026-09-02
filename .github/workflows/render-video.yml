@@ -222,16 +222,14 @@ jobs:
                   and len(line_text(candidate)) <= MAX_CHARS_PER_LINE
               )
 
-          def finish_block():
-              nonlocal lines, current_line
-
+          def finish_block(lines, current_line):
               if current_line:
                   lines.append(current_line)
-                  current_line = []
 
               if lines:
                   blocks.append(lines)
-                  lines = []
+
+              return [], []
 
           for token in tokens:
               if not current_line:
@@ -250,9 +248,9 @@ jobs:
                       current_line = saved
 
               if re.search(r"[.!?]$", token):
-                  finish_block()
+                  lines, current_line = finish_block(lines, current_line)
 
-          finish_block()
+          lines, current_line = finish_block(lines, current_line)
 
           if not blocks:
               raise RuntimeError("No subtitle blocks were created")
