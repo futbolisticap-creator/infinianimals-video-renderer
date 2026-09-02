@@ -335,6 +335,7 @@ jobs:
             [0:v]
             scale=1080:1920:force_original_aspect_ratio=increase,
             crop=1080:1920,
+            subtitles=subtitles.ass,
 
             drawtext=
               fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:
@@ -397,6 +398,8 @@ jobs:
               d=1:
               s=1080x1920:
               fps=30,
+
+            subtitles=subtitles.ass,
 
             drawtext=
               fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:
