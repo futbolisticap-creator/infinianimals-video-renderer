@@ -81,8 +81,6 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg jq curl fonts-dejavu-core
-          python -m pip install --upgrade pip
-          pip install faster-whisper
 
       - name: Download Pexels media
         run: |
@@ -172,70 +170,35 @@ jobs:
       - name: Generate dynamic subtitles
         run: |
           cat > make_subtitles.py <<'PY'
-          from faster_whisper import WhisperModel
+          import os
+          import re
+          import subprocess
 
-          model = WhisperModel(
-              "tiny.en",
-              device="cpu",
-              compute_type="int8"
-          )
+          script = os.environ.get("SCRIPT", "").strip()
 
-          segments, _ = model.transcribe(
-              "voice.wav",
-              language="en",
-              word_timestamps=True,
-              vad_filter=True
-          )
+          if not script:
+              raise RuntimeError("SCRIPT is empty; cannot create subtitles")
 
-          words = []
+          duration_raw = subprocess.check_output([
+              "ffprobe",
+              "-v", "error",
+              "-show_entries", "format=duration",
+              "-of", "default=noprint_wrappers=1:nokey=1",
+              "voice.wav"
+          ], text=True).strip()
 
-          for segment in segments:
-              if not segment.words:
-                  continue
+          duration = float(duration_raw)
 
-              for word in segment.words:
-                  if word.start is None or word.end is None:
-                      continue
-
-                  text = word.word.strip()
-                  if not text:
-                      continue
-
-                  words.append({
-                      "start": float(word.start),
-                      "end": float(word.end),
-                      "text": text
-                  })
-
-          def srt_time(seconds):
-              milliseconds = max(0, int(round(seconds * 1000)))
-
-              hours = milliseconds // 3600000
-              milliseconds %= 3600000
-
-              minutes = milliseconds // 60000
-              milliseconds %= 60000
-
-              secs = milliseconds // 1000
-              ms = milliseconds % 1000
-
-              return f"{hours:02d}:{minutes:02d}:{secs:02d},{ms:03d}"
-
+          # Split the exact narration into short TikTok/Reels-style blocks.
+          tokens = re.findall(r"\S+", script)
           groups = []
           current = []
 
-          for word in words:
-              current.append(word)
+          for token in tokens:
+              current.append(token)
+              end_punctuation = bool(re.search(r"[.!?]$", token))
 
-              duration = current[-1]["end"] - current[0]["start"]
-              text = " ".join(w["text"] for w in current)
-
-              # Short, readable blocks for TikTok/Reels/Shorts.
-              if (
-                  len(current) >= 4
-                  or duration >= 1.8
-                  or text.endswith((".", "!", "?"))
-              ):
+              if len(current) >= 4 or end_punctuation:
                   groups.append(current)
                   current = []
 
@@ -243,27 +206,88 @@ jobs:
               groups.append(current)
 
           if not groups:
-              raise RuntimeError("Whisper did not generate subtitle timestamps")
+              raise RuntimeError("No subtitle groups were created")
 
-          with open("subtitles.srt", "w", encoding="utf-8") as f:
-              for i, group in enumerate(groups, start=1):
-                  start = group[0]["start"]
-                  end = max(group[-1]["end"], start + 0.25)
+          # Estimate timing from the exact TTS duration. This guarantees that
+          # captions exist even if speech-to-text alignment fails.
+          def group_weight(group):
+              weight = 0.0
+              for word in group:
+                  clean = re.sub(r"[^A-Za-z0-9']", "", word)
+                  weight += 1.0 + max(0, len(clean) - 6) * 0.035
+              if re.search(r"[.!?]$", group[-1]):
+                  weight += 0.35
+              elif re.search(r"[,;:]$", group[-1]):
+                  weight += 0.18
+              return weight
 
-                  text = " ".join(w["text"] for w in group).upper()
+          weights = [group_weight(g) for g in groups]
+          total_weight = sum(weights)
+
+          # Keep a tiny safety margin at the start/end.
+          start_margin = 0.08
+          end_margin = 0.10
+          usable = max(0.5, duration - start_margin - end_margin)
+
+          def ass_time(seconds):
+              seconds = max(0.0, seconds)
+              hours = int(seconds // 3600)
+              minutes = int((seconds % 3600) // 60)
+              secs = seconds % 60
+              return f"{hours}:{minutes:02d}:{secs:05.2f}"
+
+          header = (
+              "[Script Info]\n"
+              "ScriptType: v4.00+\n"
+              "PlayResX: 1080\n"
+              "PlayResY: 1920\n"
+              "WrapStyle: 2\n"
+              "ScaledBorderAndShadow: yes\n"
+              "\n"
+              "[V4+ Styles]\n"
+              "Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding\n"
+              "Style: Shorts,DejaVu Sans,64,&H00FFFFFF,&H000000FF,&H00000000,&H50000000,-1,0,0,0,100,100,0,0,1,4,0,2,80,80,360,1\n"
+              "\n"
+              "[Events]\n"
+              "Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text\n"
+          )
+
+          current_time = start_margin
+
+          with open("subtitles.ass", "w", encoding="utf-8") as f:
+              f.write(header)
+
+              for i, (group, weight) in enumerate(zip(groups, weights)):
+                  block_duration = usable * (weight / total_weight)
+                  start = current_time
+                  end = min(duration - end_margin, start + block_duration)
+
+                  if i == len(groups) - 1:
+                      end = duration - end_margin
+
+                  text = " ".join(group).upper()
                   text = text.replace("{", "").replace("}", "")
+                  text = text.replace("\\", "")
 
-                  f.write(f"{i}\n")
-                  f.write(f"{srt_time(start)} --> {srt_time(end)}\n")
-                  f.write(text + "\n\n")
+                  f.write(
+                      f"Dialogue: 0,{ass_time(start)},{ass_time(end)},"
+                      f"Shorts,,0,0,0,,{text}\n"
+                  )
 
-          print(f"Created {len(groups)} subtitle blocks")
+                  current_time = end
+
+          print(f"Created {len(groups)} subtitle blocks for {duration:.2f}s narration")
           PY
 
           python make_subtitles.py
 
           echo "=== SUBTITLE PREVIEW ==="
-          head -40 subtitles.srt
+          sed -n '1,35p' subtitles.ass
+
+          if ! grep -q '^Dialogue:' subtitles.ass; then
+            echo "No subtitle dialogue lines generated"
+            exit 1
+          fi
 
       - name: Prepare branding
         run: |
@@ -307,7 +331,7 @@ jobs:
             [0:v]
             scale=1080:1920:force_original_aspect_ratio=increase,
             crop=1080:1920,
-            subtitles=subtitles.srt:force_style='FontName=DejaVu Sans,FontSize=28,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=4,Shadow=0,Alignment=2,MarginL=90,MarginR=90,MarginV=360,Bold=1',
+            ass=subtitles.ass,
 
             drawtext=
               fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:
@@ -371,7 +395,7 @@ jobs:
               s=1080x1920:
               fps=30,
 
-            subtitles=subtitles.srt:force_style='FontName=DejaVu Sans,FontSize=28,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=4,Shadow=0,Alignment=2,MarginL=90,MarginR=90,MarginV=360,Bold=1',
+            ass=subtitles.ass,
 
             drawtext=
               fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:
@@ -475,4 +499,5 @@ jobs:
           path: |
             video.mp4
             attribution.txt
+            subtitles.ass
           retention-days: 1
