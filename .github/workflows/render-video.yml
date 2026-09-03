@@ -7,49 +7,40 @@ on:
         description: "WordPress post ID"
         required: true
         type: string
-
       animal:
         description: "Animal name"
         required: true
         type: string
-
       script:
         description: "Narration script"
         required: true
         type: string
-
       article_url:
         description: "InfiniAnimals article URL"
         required: true
         type: string
-
       youtube_title:
         description: "Video title"
         required: false
         type: string
-
       media_type:
         description: "video or image"
         required: true
         type: string
-
       media_url:
-        description: "Pexels media URL"
+        description: "Fallback Pexels media URL"
         required: true
         type: string
-
       media_items:
         description: "JSON array with up to 5 media scenes"
         required: false
         type: string
-
       creator_name:
-        description: "Pexels creator"
+        description: "Fallback Pexels creator"
         required: false
         type: string
-
       pexels_page:
-        description: "Pexels source page"
+        description: "Fallback Pexels source page"
         required: false
         type: string
 
@@ -59,553 +50,184 @@ permissions:
 jobs:
   render:
     runs-on: ubuntu-latest
-
+    timeout-minutes: 20
     env:
       POST_ID: ${{ inputs.post_id }}
       ANIMAL: ${{ inputs.animal }}
       SCRIPT: ${{ inputs.script }}
       ARTICLE_URL: ${{ inputs.article_url }}
       VIDEO_TITLE: ${{ inputs.youtube_title }}
-
       MEDIA_TYPE: ${{ inputs.media_type }}
       MEDIA_URL: ${{ inputs.media_url }}
       MEDIA_ITEMS: ${{ inputs.media_items }}
-
       CREATOR_NAME: ${{ inputs.creator_name }}
       PEXELS_PAGE: ${{ inputs.pexels_page }}
-
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
 
     steps:
-    
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install tools
+      - name: Install rendering tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg jq curl fonts-dejavu-core
+          sudo apt-get install -y ffmpeg jq curl fonts-dejavu-core espeak-ng
 
-      - name: Download Bangers font
+      - name: Generate narration with Gemini and resilient fallback
         run: |
-          mkdir -p fonts
-          curl -fL "https://raw.githubusercontent.com/google/fonts/main/ofl/bangers/Bangers-Regular.ttf"             -o fonts/Bangers-Regular.ttf
-
-          if [ ! -s fonts/Bangers-Regular.ttf ]; then
-            echo "Bangers font download failed"
-            exit 1
-          fi
-
-          echo "Bangers font downloaded successfully"
-          ls -lh fonts/Bangers-Regular.ttf
-
-      - name: Download Pexels media
-        run: |
-
-          echo "Media type: $MEDIA_TYPE"
-          echo "Media URL: $MEDIA_URL"
-
-          if [ -z "$MEDIA_URL" ]; then
-            echo "No media URL received"
-            exit 1
-          fi
-
-          if [ "$MEDIA_TYPE" = "video" ]; then
-
-            curl -fL "$MEDIA_URL" -o media.mp4
-
-          elif [ "$MEDIA_TYPE" = "image" ]; then
-
-            curl -fL "$MEDIA_URL" -o media.jpg
-
-          else
-
-            echo "Unsupported media type: $MEDIA_TYPE"
-            exit 1
-
-          fi
-
-      - name: Generate narration with Gemini
-        run: |
-          PROMPT="Narrate this as an energetic, natural wildlife documentary voice for a short social media video.
-
-          Speak clearly and naturally.
-
-          Read the following script exactly:
-
-          $SCRIPT"
-
-          jq -n \
-            --arg prompt "$PROMPT" \
-            '{
-              model: "gemini-3.1-flash-tts-preview",
-              input: $prompt,
-              response_format: {
-                type: "audio"
-              },
-              generation_config: {
-                speech_config: [
-                  {
-                    voice: "Puck"
-                  }
-                ]
-              }
-            }' > request.json
+          set -euo pipefail
+          jq -n --arg prompt "Narrate this exactly as written, in an energetic natural English wildlife-documentary voice. Speak clearly and naturally. Script: $SCRIPT" '{
+            model: "gemini-3.1-flash-tts-preview",
+            input: $prompt,
+            response_format: {type: "audio"},
+            generation_config: {speech_config: [{voice: "Puck"}]}
+          }' > request.json
 
           SUCCESS=false
-
-          for ATTEMPT in 1 2 3 4 5 6; do
-            echo "Gemini TTS attempt ${ATTEMPT}/6..."
-
-            HTTP_CODE=$(curl -sS \
-              -o response.json \
-              -w "%{http_code}" \
-              -X POST \
+          for ATTEMPT in 1 2 3 4 5; do
+            echo "Gemini TTS attempt $ATTEMPT/5"
+            HTTP_CODE=$(curl -sS -o response.json -w "%{http_code}" -X POST \
               "https://generativelanguage.googleapis.com/v1beta/interactions" \
-              -H "x-goog-api-key: ${GEMINI_API_KEY}" \
+              -H "x-goog-api-key: $GEMINI_API_KEY" \
               -H "Content-Type: application/json" \
-              -d @request.json)
-
-            echo "Gemini HTTP status: ${HTTP_CODE}"
-
-            if [ "${HTTP_CODE}" = "200" ]; then
-              SUCCESS=true
-              break
+              -d @request.json || true)
+            if [ "$HTTP_CODE" = "200" ]; then
+              jq -r '.. | objects | select(.type? == "audio" and (.data? != null)) | .data' response.json | head -n 1 > audio.b64
+              if [ -s audio.b64 ]; then
+                base64 -d audio.b64 > voice.pcm
+                ffmpeg -y -f s16le -ar 24000 -ac 1 -i voice.pcm voice.wav
+                SUCCESS=true
+                break
+              fi
             fi
-
-            echo "Gemini response:"
-            cat response.json || true
-
-            if [ "${HTTP_CODE}" = "429" ]; then
-              WAIT_SECONDS=$((ATTEMPT * 15))
-              echo "Rate limited by Gemini. Waiting ${WAIT_SECONDS}s before retry..."
-              sleep "${WAIT_SECONDS}"
-            elif [ "${HTTP_CODE}" -ge 500 ] 2>/dev/null; then
-              WAIT_SECONDS=$((ATTEMPT * 10))
-              echo "Temporary Gemini server error. Waiting ${WAIT_SECONDS}s before retry..."
-              sleep "${WAIT_SECONDS}"
-            else
-              echo "Gemini returned a non-retryable HTTP error: ${HTTP_CODE}"
-              exit 1
-            fi
+            WAIT_SECONDS=$((ATTEMPT * 10))
+            echo "Gemini returned $HTTP_CODE; retrying in $WAIT_SECONDS seconds"
+            sleep "$WAIT_SECONDS"
           done
 
-          if [ "${SUCCESS}" != "true" ]; then
-            echo "Gemini TTS failed after 6 attempts."
-            echo "Last response:"
-            cat response.json || true
-            exit 1
+          if [ "$SUCCESS" != "true" ]; then
+            echo "Gemini TTS unavailable; using local speech fallback so rendering can finish"
+            espeak-ng -v en-us+m3 -s 155 -w voice.wav "$SCRIPT"
           fi
 
-          jq -r \
-            '.. | objects |
-            select(.type? == "audio" and (.data? != null)) |
-            .data' \
-            response.json \
-            | head -n 1 \
-            > audio.b64
+          test -s voice.wav
+          DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 voice.wav)
+          echo "DURATION=$DURATION" >> "$GITHUB_ENV"
+          echo "Narration duration: $DURATION"
 
-          if [ ! -s audio.b64 ]; then
-            echo "Gemini returned HTTP 200 but no audio was found."
-            cat response.json
-            exit 1
-          fi
-
-          base64 -d audio.b64 > voice.pcm
-
-          ffmpeg -y \
-            -f s16le \
-            -ar 24000 \
-            -ac 1 \
-            -i voice.pcm \
-            voice.wav
-
-          if [ ! -s voice.wav ]; then
-            echo "voice.wav was not created correctly"
-            exit 1
-          fi
-
-          echo "Narration generated successfully."
-
-      - name: Generate dynamic subtitles
+      - name: Create timed subtitles
         run: |
-          cat > make_subtitles.py <<'PY'
-          import os
-          import re
-          import subprocess
+          python3 - <<'PY'
+          import os, re, subprocess
 
-          script = os.environ.get("SCRIPT", "").strip()
+          script = os.environ["SCRIPT"].strip()
+          duration = float(subprocess.check_output([
+              "ffprobe", "-v", "error", "-show_entries", "format=duration",
+              "-of", "default=noprint_wrappers=1:nokey=1", "voice.wav"
+          ], text=True).strip())
+          words = re.findall(r"\S+", script)
+          chunks = [words[i:i + 5] for i in range(0, len(words), 5)] or [["InfiniAnimals"]]
+          weights = [max(1, sum(len(re.sub(r"\W", "", w)) for w in chunk)) for chunk in chunks]
+          total = sum(weights)
 
-          if not script:
-              raise RuntimeError("SCRIPT is empty; cannot create subtitles")
+          def stamp(value):
+              value = max(0.0, value)
+              hours = int(value // 3600)
+              minutes = int((value % 3600) // 60)
+              seconds = value % 60
+              return f"{hours:02d}:{minutes:02d}:{seconds:06.3f}".replace(".", ",")
 
-          # Build short subtitle cards:
-          # - maximum 2 lines
-          # - maximum 3 words per line
-          # - target maximum 18 visible characters per line
-          tokens = re.findall(r"\S+", script)
-
-          MAX_WORDS_PER_LINE = 3
-          MAX_CHARS_PER_LINE = 18
-
-          def clean_token(token):
-              token = token.replace("{", "").replace("}", "")
-              token = token.replace("\\", "")
-              return token
-
-          tokens = [clean_token(t) for t in tokens if clean_token(t)]
-
-          blocks = []
-          lines = []
-          current_line = []
-
-          def line_text(words):
-              return " ".join(words)
-
-          def can_add(word, line):
-              candidate = line + [word]
-              return (
-                  len(candidate) <= MAX_WORDS_PER_LINE
-                  and len(line_text(candidate)) <= MAX_CHARS_PER_LINE
-              )
-
-          def finish_block(lines, current_line):
-              if current_line:
-                  lines.append(current_line)
-
-              if lines:
-                  blocks.append(lines)
-
-              return [], []
-
-          for token in tokens:
-              if not current_line:
-                  current_line = [token]
-              elif can_add(token, current_line):
-                  current_line.append(token)
-              else:
-                  lines.append(current_line)
-                  current_line = [token]
-
-                  if len(lines) >= 2:
-                      saved = current_line
-                      current_line = []
-                      blocks.append(lines)
-                      lines = []
-                      current_line = saved
-
-              if re.search(r"[.!?]$", token):
-                  lines, current_line = finish_block(lines, current_line)
-
-          lines, current_line = finish_block(lines, current_line)
-
-          if not blocks:
-              raise RuntimeError("No subtitle blocks were created")
-
-          def block_words(block):
-              return [word for line in block for word in line]
-
-          def block_weight(block):
-              words = block_words(block)
-              weight = 0.0
-
-              for word in words:
-                  clean = re.sub(r"[^A-Za-z0-9']", "", word)
-                  weight += 1.0 + max(0, len(clean) - 6) * 0.05
-
-              if words and re.search(r"[.!?]$", words[-1]):
-                  weight += 0.30
-              elif words and re.search(r"[,;:]$", words[-1]):
-                  weight += 0.15
-
-              return max(weight, 1.0)
-
-          duration_raw = subprocess.check_output([
-              "ffprobe",
-              "-v", "error",
-              "-show_entries", "format=duration",
-              "-of", "default=noprint_wrappers=1:nokey=1",
-              "voice.wav"
-          ], text=True).strip()
-
-          duration = float(duration_raw)
-
-          weights = [block_weight(block) for block in blocks]
-          total_weight = sum(weights)
-
-          start_margin = 0.08
-          end_margin = 0.10
-          usable = max(0.5, duration - start_margin - end_margin)
-
-          def ass_time(seconds):
-              seconds = max(0.0, seconds)
-              hours = int(seconds // 3600)
-              minutes = int((seconds % 3600) // 60)
-              secs = seconds % 60
-              return f"{hours}:{minutes:02d}:{secs:05.2f}"
-
-          header = (
-              "[Script Info]\n"
-              "Title: InfiniAnimals Dynamic Captions\n"
-              "ScriptType: v4.00+\n"
-              "PlayResX: 1080\n"
-              "PlayResY: 1920\n"
-              "WrapStyle: 2\n"
-              "ScaledBorderAndShadow: yes\n"
-              "\n"
-              "[V4+ Styles]\n"
-              "Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding\n"
-              "Style: Shorts,Bangers,64,&H00FFFFFF,&H000000FF,&H00000000,&H30000000,0,0,0,0,100,100,1,0,1,5,2,2,90,90,360,1\n"
-              "\n"
-              "[Events]\n"
-              "Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text\n"
-          )
-
-          current_time = start_margin
-
-          with open("subtitles.ass", "w", encoding="utf-8") as f:
-              f.write(header)
-
-              for i, (block, weight) in enumerate(zip(blocks, weights)):
-                  block_duration = usable * (weight / total_weight)
-                  start = current_time
-                  end = min(duration - end_margin, start + block_duration)
-
-                  if i == len(blocks) - 1:
-                      end = duration - end_margin
-
-                  rendered_lines = [
-                      " ".join(line).upper()
-                      for line in block[:2]
-                  ]
-                  text = r"\N".join(rendered_lines)
-
-                  f.write(
-                      f"Dialogue: 0,{ass_time(start)},{ass_time(end)},"
-                      f"Shorts,,0,0,0,,{text}\n"
-                  )
-
-                  current_time = end
-
-          print(f"Created {len(blocks)} subtitle blocks for {duration:.2f}s narration")
-          print("Font: Bangers")
-          print("Max 2 lines / 3 words per line / ~18 chars per line")
+          cursor = 0.0
+          with open("subtitles.srt", "w", encoding="utf-8") as handle:
+              for index, (chunk, weight) in enumerate(zip(chunks, weights), 1):
+                  end = duration if index == len(chunks) else cursor + duration * weight / total
+                  handle.write(f"{index}\n{stamp(cursor)} --> {stamp(end)}\n{' '.join(chunk).upper()}\n\n")
+                  cursor = end
           PY
-
-          python make_subtitles.py
-
-          echo "=== SUBTITLE PREVIEW ==="
-          sed -n '1,40p' subtitles.ass
-
-          if ! grep -q '^Dialogue:' subtitles.ass; then
-            echo "No subtitle dialogue lines generated"
-            exit 1
-          fi
+          test -s subtitles.srt
 
       - name: Prepare branding
         run: |
-
           printf '%s\n' "$ANIMAL" > animal.txt
+          printf '%s\n' "InfiniAnimals.com" > website.txt
+          printf '%s\n' "Read the full animal guide" > cta1.txt
+          printf '%s\n' "InfiniAnimals.com" > cta2.txt
 
-          printf '%s\n' \
-            "InfiniAnimals.com" \
-            > website.txt
-
-          printf '%s\n' \
-            "Read the full animal guide" \
-            > cta1.txt
-
-          printf '%s\n' \
-            "InfiniAnimals.com" \
-            > cta2.txt
-
-      - name: Get narration duration
+      - name: Download and normalize up to five Pexels scenes
         run: |
+          set -euo pipefail
+          mkdir -p raw scenes
 
-          DURATION=$(ffprobe \
-            -v error \
-            -show_entries format=duration \
-            -of default=noprint_wrappers=1:nokey=1 \
-            voice.wav)
+          if printf '%s' "$MEDIA_ITEMS" | jq -e 'type == "array" and length > 0' >/dev/null 2>&1; then
+            printf '%s' "$MEDIA_ITEMS" | jq '.[0:5]' > scenes.json
+          else
+            jq -n --arg type "$MEDIA_TYPE" --arg url "$MEDIA_URL" \
+              --arg creator "$CREATOR_NAME" --arg page "$PEXELS_PAGE" \
+              '[{type:$type,url:$url,creator_name:$creator,pexels_page:$page}]' > scenes.json
+          fi
 
-          echo "DURATION=$DURATION" >> "$GITHUB_ENV"
+          COUNT=$(jq 'length' scenes.json)
+          if [ "$COUNT" -lt 1 ]; then
+            echo "No usable media received"
+            exit 1
+          fi
 
-          echo "Narration duration: $DURATION"
+          SEGMENT=$(python3 -c "print(float('$DURATION') / int('$COUNT') + 0.35)")
+          : > concat-scenes.txt
 
-      - name: Create video from Pexels clip
-        if: env.MEDIA_TYPE == 'video'
+          for INDEX in $(seq 0 $((COUNT - 1))); do
+            TYPE=$(jq -r ".[$INDEX].type // empty" scenes.json)
+            URL=$(jq -r ".[$INDEX].url // empty" scenes.json)
+            if [ -z "$URL" ]; then
+              echo "Scene $INDEX has no URL"
+              exit 1
+            fi
+
+            if [ "$TYPE" = "video" ]; then
+              curl --retry 3 --retry-all-errors -fL "$URL" -o "raw/$INDEX.mp4"
+              ffmpeg -y -stream_loop -1 -i "raw/$INDEX.mp4" -t "$SEGMENT" \
+                -vf "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,fps=30,setpts=PTS-STARTPTS" \
+                -an -c:v libx264 -preset fast -crf 21 -pix_fmt yuv420p "scenes/$INDEX.mp4"
+            elif [ "$TYPE" = "image" ]; then
+              curl --retry 3 --retry-all-errors -fL "$URL" -o "raw/$INDEX.jpg"
+              ffmpeg -y -loop 1 -framerate 30 -i "raw/$INDEX.jpg" -t "$SEGMENT" \
+                -vf "scale=1200:2134:force_original_aspect_ratio=increase,crop=1200:2134,zoompan=z='min(zoom+0.0005,1.12)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:s=1080x1920:fps=30,setpts=PTS-STARTPTS" \
+                -an -c:v libx264 -preset fast -crf 21 -pix_fmt yuv420p "scenes/$INDEX.mp4"
+            else
+              echo "Unsupported scene type: $TYPE"
+              exit 1
+            fi
+            printf "file 'scenes/%s.mp4'\n" "$INDEX" >> concat-scenes.txt
+          done
+
+          ffmpeg -y -f concat -safe 0 -i concat-scenes.txt -c copy silent-scenes.mp4
+          echo "Prepared $COUNT scenes"
+
+      - name: Render narrated multiscene video
         run: |
-
-          ffmpeg -y \
-            -stream_loop -1 \
-            -i media.mp4 \
-            -i voice.wav \
-            -filter_complex "
-            [0:v]
-            scale=1080:1920:force_original_aspect_ratio=increase,
-            crop=1080:1920,
-            ass=subtitles.ass:fontsdir=fonts,
-
-            drawtext=
-              fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:
-              textfile=animal.txt:
-              fontcolor=white:
-              fontsize=54:
-              box=1:
-              boxcolor=black@0.45:
-              boxborderw=18:
-              x=(w-text_w)/2:
-              y=90,
-
-            drawtext=
-              fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:
-              textfile=website.txt:
-              fontcolor=white:
-              fontsize=45:
-              box=1:
-              boxcolor=black@0.55:
-              boxborderw=15:
-              x=(w-text_w)/2:
-              y=h-170,
-
-            fps=30
-            [video]
-            " \
-            -map "[video]" \
-            -map 1:a \
-            -t "$DURATION" \
-            -c:v libx264 \
-            -preset medium \
-            -crf 20 \
-            -pix_fmt yuv420p \
-            -c:a aac \
-            -b:a 192k \
-            -ar 24000 \
-            -ac 1 \
-            -movflags +faststart \
-            -shortest \
-            main.mp4
-
-      - name: Create video from Pexels photo
-        if: env.MEDIA_TYPE == 'image'
-        run: |
-
-          ffmpeg -y \
-            -loop 1 \
-            -framerate 30 \
-            -i media.jpg \
-            -i voice.wav \
-            -filter_complex "
-            [0:v]
-            scale=1200:2134:force_original_aspect_ratio=increase,
-            crop=1200:2134,
-
-            zoompan=
-              z='min(zoom+0.0005,1.12)':
-              x='iw/2-(iw/zoom/2)':
-              y='ih/2-(ih/zoom/2)':
-              d=1:
-              s=1080x1920:
-              fps=30,
-
-            ass=subtitles.ass:fontsdir=fonts,
-
-            drawtext=
-              fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:
-              textfile=animal.txt:
-              fontcolor=white:
-              fontsize=54:
-              box=1:
-              boxcolor=black@0.45:
-              boxborderw=18:
-              x=(w-text_w)/2:
-              y=90,
-
-            drawtext=
-              fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:
-              textfile=website.txt:
-              fontcolor=white:
-              fontsize=45:
-              box=1:
-              boxcolor=black@0.55:
-              boxborderw=15:
-              x=(w-text_w)/2:
-              y=h-170
-
-            [video]
-            " \
-            -map "[video]" \
-            -map 1:a \
-            -t "$DURATION" \
-            -c:v libx264 \
-            -preset medium \
-            -crf 20 \
-            -pix_fmt yuv420p \
-            -c:a aac \
-            -b:a 192k \
-            -ar 24000 \
-            -ac 1 \
-            -movflags +faststart \
-            -shortest \
-            main.mp4
+          ffmpeg -y -i silent-scenes.mp4 -i voice.wav \
+            -filter_complex "[0:v]subtitles=subtitles.srt:force_style='FontName=DejaVu Sans,FontSize=18,PrimaryColour=&H00FFFFFF,OutlineColour=&H000000,BorderStyle=1,Outline=3,Alignment=2,MarginV=320',drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:textfile=animal.txt:fontcolor=white:fontsize=54:box=1:boxcolor=black@0.45:boxborderw=18:x=(w-text_w)/2:y=90,drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:textfile=website.txt:fontcolor=white:fontsize=45:box=1:boxcolor=black@0.55:boxborderw=15:x=(w-text_w)/2:y=h-170[video]" \
+            -map "[video]" -map 1:a -t "$DURATION" \
+            -c:v libx264 -preset medium -crf 20 -pix_fmt yuv420p \
+            -c:a aac -b:a 192k -ar 24000 -ac 1 -movflags +faststart -shortest main.mp4
+          test -s main.mp4
 
       - name: Create InfiniAnimals end screen
         run: |
-
-          ffmpeg -y \
-            -f lavfi \
-            -i "color=c=black:s=1080x1920:d=3:r=30" \
-            -f lavfi \
-            -i "anullsrc=channel_layout=mono:sample_rate=24000" \
-            -vf "
-            drawtext=
-              fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:
-              textfile=cta1.txt:
-              fontcolor=white:
-              fontsize=54:
-              x=(w-text_w)/2:
-              y=720,
-
-            drawtext=
-              fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:
-              textfile=cta2.txt:
-              fontcolor=white:
-              fontsize=85:
-              x=(w-text_w)/2:
-              y=900
-            " \
-            -t 3 \
-            -c:v libx264 \
-            -pix_fmt yuv420p \
-            -c:a aac \
-            -ar 24000 \
-            -ac 1 \
-            end.mp4
+          ffmpeg -y -f lavfi -i "color=c=black:s=1080x1920:d=3:r=30" \
+            -f lavfi -i "anullsrc=channel_layout=mono:sample_rate=24000" \
+            -vf "drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:textfile=cta1.txt:fontcolor=white:fontsize=54:x=(w-text_w)/2:y=720,drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:textfile=cta2.txt:fontcolor=white:fontsize=85:x=(w-text_w)/2:y=900" \
+            -t 3 -c:v libx264 -pix_fmt yuv420p -c:a aac -ar 24000 -ac 1 end.mp4
 
       - name: Join video and promotional screen
         run: |
-
-          printf \
-            "file 'main.mp4'\nfile 'end.mp4'\n" \
-            > files.txt
-
-          ffmpeg -y \
-            -f concat \
-            -safe 0 \
-            -i files.txt \
-            -c copy \
-            -movflags +faststart \
-            video.mp4
+          printf "file 'main.mp4'\nfile 'end.mp4'\n" > files.txt
+          ffmpeg -y -f concat -safe 0 -i files.txt -c copy -movflags +faststart video.mp4
+          test -s video.mp4
 
       - name: Save Pexels attribution
         run: |
-
-          echo "Media source: Pexels" > attribution.txt
-          echo "Creator: $CREATOR_NAME" >> attribution.txt
-          echo "Source: $PEXELS_PAGE" >> attribution.txt
-          echo "Article: $ARTICLE_URL" >> attribution.txt
+          {
+            echo "Article: $ARTICLE_URL"
+            jq -r '.[] | "Media source: Pexels\nCreator: \(.creator_name // "")\nSource: \(.pexels_page // "")\n"' scenes.json
+          } > attribution.txt
 
       - name: Upload final video
         uses: actions/upload-artifact@v4
@@ -614,5 +236,6 @@ jobs:
           path: |
             video.mp4
             attribution.txt
-            subtitles.ass
+            subtitles.srt
+            scenes.json
           retention-days: 1
